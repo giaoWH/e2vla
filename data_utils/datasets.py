@@ -272,6 +272,32 @@ class OpenOven(H5DatasetMapBase):
         h5_files.sort()
         return cls(h5_files)
 
+class SelfAlohaPickPlace1031(H5DatasetMapBase):
+    config = DataConfig(
+        record_dt=1.0 / 10,
+        sample_dt=1.0 / 10,
+        output_image_hw=(224, 224),
+        ee_indices=(0,),
+        camera_names=("head_cam", "rh_cam"),
+        sample_state_gaps=1,
+        sample_camera_gaps=1,
+        shuffle_cameras=False,
+    )
+
+    @classmethod
+    def inst(cls):
+        h5_files = glob.glob(
+            "/nas_data_new/zzj/data_ssd/self_aloha/data_hdf5/pick_place_1031/**/*.h5",
+            recursive=True,
+        )
+        h5_files += glob.glob(
+            "/nas_data_new/zzj/data_ssd/self_aloha/data_hdf5/pick_place_1031/**/*.hdf5",
+            recursive=True,
+        )
+        h5_files.sort()
+        print("[INFO] num samples of {}: {}".format(cls.__name__, len(h5_files)))
+        assert len(h5_files) > 0
+        return cls(h5_files)
 
 def get_subclasses(base_class):
     current_module = sys.modules[__name__]

@@ -56,27 +56,39 @@ with h5py.File(files[0], "r") as f:
 PY
 ```
 
-理想情况下，每个文件至少应包含类似字段：
+你当前 `pick_place_1031` 数据检查结果是兼容的。每个文件里有类似字段：
 
 ```text
-ee_pose              # (T, 4, 4) 或 (T, Nee, 4, 4)
-gripper              # (T,) 或 (T, Nee)
+ee_pose              # (T, 1, 4, 4)
+gripper              # (T, 1)
+gripper_desired      # (T, 1)
 timestamp            # (T,)
+qpos                 # (T, 1, 6)，当前训练代码不会使用
+qpos_desired         # (T, 1, 6)，当前训练代码不会使用
 
 head_cam/rgb
 head_cam/pose
 head_cam/K
+
+lh_cam/rgb
+lh_cam/pose
+lh_cam/K
 
 rh_cam/rgb
 rh_cam/pose
 rh_cam/K
 ```
 
-并且 HDF5 attrs 里最好有：
+并且 HDF5 attrs 里有：
 
 ```text
 prompt_text
+ee_indices
+compress
+is_bgr
 ```
+
+其中 `prompt_text` 会作为语言指令。`is_bgr=True` 也能被当前读取代码处理，训练时会把 BGR 通道翻成 RGB。
 
 如果没有 `prompt_text`，代码会退化成默认 prompt：
 
@@ -84,7 +96,7 @@ prompt_text
 Do any possible actions
 ```
 
-如果数据里只有 `joint_pos`，没有 `ee_pose`，不能直接微调当前模型。当前 E2VLA 的监督目标是未来末端执行器位姿轨迹，不是关节角轨迹。需要先通过机器人 FK 把关节角转换成 `ee_pose`。
+当前数据里已经有 `ee_pose`，所以可以直接用当前模型微调。`qpos` / `qpos_desired` 会被忽略，因为当前 E2VLA 的监督目标是未来末端执行器位姿轨迹，不是关节角轨迹。
 
 ## 3. 注册自定义 Dataset
 
@@ -127,7 +139,7 @@ class SelfAlohaPickPlace1031(H5DatasetMapBase):
 
 这里的关键配置：
 
-- `camera_names=("head_cam", "rh_cam")`：必须和 HDF5 里的相机 group 名一致。
+- `camera_names=("head_cam", "rh_cam")`：必须和 HDF5 里的相机 group 名一致。当前数据里也有 `lh_cam`，但只训练右臂时可以先不用。
 - `output_image_hw=(224, 224)`：图像会 resize/crop 到 224x224。
 - `record_dt=1.0/10`、`sample_dt=1.0/10`：按 10 Hz 采样。
 - `ee_indices=(0,)`：只训练第 0 个末端执行器。
@@ -152,7 +164,7 @@ CONFIGS["finetune_self_aloha_pick_place_1031"] = TrainConfig(
     sample_multiplex=1000,
     num_warmup=int(2e3),
     save_interval=int(10e3),
-    max_iterations=int(70e3),
+    max_iterations=int(30e3),
 )
 ```
 
@@ -204,7 +216,22 @@ PY
 
 ## 6. 启动微调
 
-用预训练 checkpoint 微调。这里 batch size 固定使用 `32`：
+训练建议放在 `tmux` 里运行，避免 SSH 断开后训练进程被杀。
+
+先新建一个 tmux 会话：
+
+```bash
+tmux new -s e2vla_finetune
+```
+
+进入 tmux 后，激活环境并进入项目目录：
+
+```bash
+conda activate e2vla
+cd /home/wh/e2vla
+```
+
+然后用预训练 checkpoint 微调。这里 batch size 固定使用 `32`：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train.py \
@@ -223,6 +250,36 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   -s finetune_pick_place_1031 \
   --bs 32 \
   --workers 4
+```
+
+如果要临时离开 tmux，但保持训练继续运行，按：
+
+```text
+Ctrl-b 然后按 d
+```
+
+重新进入训练会话：
+
+```bash
+tmux attach -t e2vla_finetune
+```
+
+查看已有 tmux 会话：
+
+```bash
+tmux ls
+```
+
+如果确认要停止训练，在 tmux 会话里按：
+
+```text
+Ctrl-c
+```
+
+如果要关闭整个 tmux 会话：
+
+```bash
+tmux kill-session -t e2vla_finetune
 ```
 
 ## 7. 输出位置

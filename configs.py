@@ -116,3 +116,12 @@ CONFIGS["finetune_libero_10"] = TrainConfig(
     save_interval=int(10e3),
     max_iterations=int(70e3),
 )
+
+CONFIGS["finetune_self_aloha_pick_place_1031"] = TrainConfig(
+    dataset_classes=[datasets.SelfAlohaPickPlace1031],
+    dataset_weights=[1],
+    sample_multiplex=1000,
+    num_warmup=int(2e3),
+    save_interval=int(10e3),
+    max_iterations=int(30e3),
+)
