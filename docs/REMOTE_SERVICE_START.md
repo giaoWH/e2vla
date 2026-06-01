@@ -122,7 +122,7 @@ CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
 ```bash
 conda activate e2vla
 cd /home/wh/e2vla
-pyro4-ns -n 0.0.0.0 -p 9090
+pyro4-ns -n 0.0.0.0 -p 9091
 ```
 
 终端 2：
@@ -134,9 +134,9 @@ CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
   --ckpt /home/wh/e2vla/checkpoints/E2VLA/finetune_pick_place_1031/ckpt_best.pt \
   --uri e2vla \
   --ns_host 10.15.194.83 \
-  --ns_port 9090 \
+  --ns_port 9091 \
   --host 10.15.194.83 \
-  --port 9091
+  --port 40911
 ```
 
 客户端连接时也要使用同样的 `uri`、`ns_host`、`ns_port`：
@@ -147,15 +147,8 @@ from shm_transport import get_shm_proxy
 policy = get_shm_proxy(
     uri_name="e2vla",
     ns_host="10.15.194.83",
-    ns_port=9090,
+    ns_port=9091,
 )
-```
-
-如果服务器有防火墙，需要放行：
-
-```text
-9090  # Pyro4 naming server
-9091  # remote_service daemon port
 ```
 
 ## 5. 快速验证
