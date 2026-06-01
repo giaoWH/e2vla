@@ -23,12 +23,12 @@ python -m infer_utils.remote_service
 
 确认你有 E2VLA checkpoint。`remote_service.py` 不会自动下载策略模型权重，必须手动指定：
 
-你现在已经下载好的 checkpoint 和配置文件是：
+你现在已经准备好的 checkpoint 和配置文件是：
 
 ```text
-/home/wh/e2vla/checkpoints/0927_e2vla_base_pretrain/
-  ckpt_0600000.pt
-  202509271301.json
+/home/wh/e2vla/checkpoints/E2VLA/finetune_pick_place_1031/
+      ckpt_best.pt
+      202605311746.json
 ```
 
 注意：checkpoint 所在目录里还需要有训练时保存的 `.json` 配置文件，否则服务启动时会报：
@@ -91,7 +91,7 @@ localhost:9090
 conda activate e2vla
 cd /home/wh/e2vla
 CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
-  --ckpt /home/wh/e2vla/checkpoints/0927_e2vla_base_pretrain/ckpt_0600000.pt \
+  --ckpt /home/wh/e2vla/checkpoints/E2VLA/finetune_pick_place_1031/ckpt_best.pt \
   --uri e2vla \
   --ns_host localhost \
   --ns_port 9090 \
@@ -131,7 +131,7 @@ pyro4-ns -n 0.0.0.0 -p 9090
 conda activate e2vla
 cd /home/wh/e2vla
 CUDA_VISIBLE_DEVICES=0 python -m infer_utils.remote_service \
-  --ckpt /home/wh/e2vla/checkpoints/0927_e2vla_base_pretrain/ckpt_0600000.pt \
+  --ckpt /home/wh/e2vla/checkpoints/E2VLA/finetune_pick_place_1031/ckpt_best.pt \
   --uri e2vla \
   --ns_host 10.15.194.83 \
   --ns_port 9090 \

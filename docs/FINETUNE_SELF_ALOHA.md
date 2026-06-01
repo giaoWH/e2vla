@@ -290,6 +290,20 @@ tmux kill-session -t e2vla_finetune
 /home/wh/e2vla/logs/E2VLA/finetune_pick_place_1031
 ```
 
+日志需要使用tensorboard查看
+
+在终端输入
+```bash
+conda activate e2vla
+cd /home/wh/e2vla
+
+tensorboard \
+  --logdir /home/wh/e2vla/logs/E2VLA/finetune_pick_place_1031 \
+  --host 0.0.0.0 \
+  --port 6006
+```
+然后使用远程桌面连接服务器，用浏览器打开http://localhost:6006即可
+
 checkpoint 会保存到：
 
 ```text
