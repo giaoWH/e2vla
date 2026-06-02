@@ -327,13 +327,19 @@ class TrajPlanner(object):
             return None
 
         old_ee_poses, old_grippers, old_time = normalized
+        B, Ta, Nee, _ = obs_data["gt_future_ee_states"].shape
         model_future_time = self._make_model_future_time(obs_data)
         valid_time_mask = (
             (model_future_time >= old_time[0])
             & (model_future_time <= old_time[-1])
         )
         valid_overlap = int(valid_time_mask.sum())
+        delay_steps = max(0, int(rtc_context.get("delay_steps_est", 0)))
         min_overlap = max(0, int(rtc_context.get("rtc_min_overlap", 3)))
+        valid_indices = np.flatnonzero(valid_time_mask)
+        overlap_start_step = int(valid_indices[0]) if len(valid_indices) > 0 else Ta
+        overlap_steps = int(valid_indices[-1] + 1) if len(valid_indices) > 0 else 0
+        free_tail_steps = max(0, Ta - overlap_steps)
         has_target = valid_overlap >= min_overlap
 
         aligned = align.align_data(
@@ -349,7 +355,6 @@ class TrajPlanner(object):
             },
         )
 
-        B, Ta, Nee, _ = obs_data["gt_future_ee_states"].shape
         rtc_target_world_np = np.zeros((Ta, Nee, 17), dtype=np.float32)
         rtc_target_world_np[..., :16] = aligned["ee_pose"].astype(np.float32).reshape(Ta, Nee, 16)
         rtc_target_world_np[..., -1] = aligned["gripper"].astype(np.float32)
@@ -375,16 +380,23 @@ class TrajPlanner(object):
             rtc_target_world.transpose(1, 2)[valid_ee_mask],
         ).detach()
 
-        delay_steps = max(0, int(rtc_context.get("delay_steps_est", 0)))
-        alpha = max(0.0, float(rtc_context.get("rtc_mask_alpha", 0.2)))
+        alpha = max(0.0, float(rtc_context.get("rtc_mask_alpha", 1.0)))
         step_index = np.arange(Ta, dtype=np.float32)
-        weights = np.where(
-            step_index < delay_steps,
-            1.0,
-            np.exp(-alpha * (step_index - delay_steps)),
-        ).astype(np.float32)
-        overlap_steps = int(np.flatnonzero(valid_time_mask)[-1] + 1) if valid_overlap > 0 else 0
-        weights[step_index >= overlap_steps] = 0.0
+        weights = np.zeros(Ta, dtype=np.float32)
+        # Original RTC soft mask: hard prefix, decayed overlap, zero free tail.
+        hard_prefix = step_index < min(delay_steps, overlap_steps)
+        weights[hard_prefix] = 1.0
+
+        soft_mask = (step_index >= delay_steps) & (step_index < overlap_steps)
+        if soft_mask.any():
+            denom = max(float(overlap_steps - delay_steps + 1), 1.0)
+            c = (overlap_steps - step_index[soft_mask]) / denom
+            if alpha <= 0:
+                weights[soft_mask] = c
+            else:
+                weights[soft_mask] = (
+                    np.exp(alpha * c) - 1.0
+                ) / max(np.exp(alpha) - 1.0, 1e-6)
         weights[~valid_time_mask] = 0.0
         if not has_target:
             weights[:] = 0.0
@@ -408,7 +420,9 @@ class TrajPlanner(object):
             "rtc_mask": rtc_mask,
             "rtc_has_target": bool(has_target and np.any(weights > 0)),
             "delay_steps": delay_steps,
+            "overlap_start_step": overlap_start_step,
             "overlap_steps": overlap_steps,
+            "free_tail_steps": free_tail_steps,
             "valid_overlap": valid_overlap,
             "rtc_guidance_scale": float(rtc_context.get("rtc_guidance_scale", 0.5)),
             "rtc_max_grad_norm": float(rtc_context.get("rtc_max_grad_norm", 1.0)),
@@ -420,13 +434,19 @@ class TrajPlanner(object):
         target = rtc_context["rtc_target_action"]
         mask = rtc_context["rtc_mask"]
         print(
-            "[RTC] mode={}, has_target={}, delay={}, overlap={}, valid_overlap={}, "
+            "[RTC] mode={}, has_target={}, delay={}, delay_time={:.1f} ms, "
+            "obs_age={:.1f} ms, overlap_start={}, overlap_end={}, "
+            "free_tail={}, valid_overlap={}, "
             "target_shape={}, mask_shape={}, target_minmax=({:.4f},{:.4f}), "
             "mask_minmax=({:.4f},{:.4f})".format(
                 rtc_context["rtc_mode"],
                 rtc_context["rtc_has_target"],
                 rtc_context["delay_steps"],
+                float(rtc_context.get("delay_time_est", 0.0)) * 1000.0,
+                float(rtc_context.get("request_obs_age", 0.0)) * 1000.0,
+                rtc_context["overlap_start_step"],
                 rtc_context["overlap_steps"],
+                rtc_context["free_tail_steps"],
                 rtc_context["valid_overlap"],
                 tuple(target.shape),
                 tuple(mask.shape),
