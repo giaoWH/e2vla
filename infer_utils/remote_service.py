@@ -53,8 +53,13 @@ class Service(TrajPlanner):
         super().add_obs_frame(obs_frame)
     
     @expose()
-    def get_action(self, draw_traj: bool = False, compress_traj_img: bool = False):
-        return super().get_action(draw_traj, compress_traj_img)
+    def get_action(
+        self,
+        draw_traj: bool = False,
+        compress_traj_img: bool = False,
+        rtc_context=None,
+    ):
+        return super().get_action(draw_traj, compress_traj_img, rtc_context)
     
     @expose()
     def set_ensemble_nums(self, n: int):

@@ -1,4 +1,6 @@
-from typing import Optional
+from contextlib import nullcontext
+from typing import Optional, Dict
+import torch
 from torch import nn, Tensor
 
 from .vlm import VLM
@@ -69,6 +71,7 @@ class VLA(nn.Module):
         valid_ee_mask: Tensor, 
         inference: bool, 
         fp16: bool,
+        rtc_context: Optional[Dict] = None,
     ):
         """
         Args:
@@ -100,15 +103,21 @@ class VLA(nn.Module):
             loss (Tensor): scalar tensor
             metrics (Dict[str, Tensor]): metrics for logging
         """
-        vl_obs, vl_feature = self.vlm(
-            obs_rgbs=obs_rgbs,
-            obs_masks=obs_masks,
-            obs_norm_xys=obs_norm_xys,
-            obs_extrinsics=obs_extrinsics,
+        rtc_mode = "off"
+        if isinstance(rtc_context, dict):
+            rtc_mode = str(rtc_context.get("rtc_mode", "off")).lower()
 
-            prompt_text=prompt_text,
-            fp16=fp16
-        )
+        context_manager = torch.no_grad() if inference and rtc_mode == "soft" else nullcontext()
+        with context_manager:
+            vl_obs, vl_feature = self.vlm(
+                obs_rgbs=obs_rgbs,
+                obs_masks=obs_masks,
+                obs_norm_xys=obs_norm_xys,
+                obs_extrinsics=obs_extrinsics,
+
+                prompt_text=prompt_text,
+                fp16=fp16
+            )
 
         # ### select the latest frame for higher execution frequency of action expert
         # obs_rgbs = obs_rgbs[:, -1:]             # (B, To=1, ncam, 3, H, W)
@@ -126,7 +135,8 @@ class VLA(nn.Module):
             gt_future_ee_states=gt_future_ee_states,
             valid_ee_mask=valid_ee_mask, 
             inference=inference,
-            fp16=fp16
+            fp16=fp16,
+            rtc_context=rtc_context,
         )
 
 

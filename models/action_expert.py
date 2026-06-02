@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from contextlib import nullcontext
 from einops import rearrange
 from torch import nn, Tensor
 from diffusers import DDIMScheduler
@@ -281,11 +282,73 @@ class ActionExpert(nn.Module):
         """dimension of action defined in camera frame"""
         return 10
 
+    def _get_rtc_mode(self, rtc_context: Optional[Dict]) -> str:
+        if not isinstance(rtc_context, dict):
+            return "off"
+        return str(rtc_context.get("rtc_mode", "off")).lower()
+
+    def _has_rtc_target(self, rtc_context: Optional[Dict]) -> bool:
+        if not isinstance(rtc_context, dict):
+            return False
+        if not bool(rtc_context.get("rtc_has_target", False)):
+            return False
+        return (
+            isinstance(rtc_context.get("rtc_target_action"), Tensor)
+            and isinstance(rtc_context.get("rtc_mask"), Tensor)
+        )
+
+    def _apply_hard_rtc(self, actions: Tensor, rtc_context: Optional[Dict]) -> Tensor:
+        if not self._has_rtc_target(rtc_context):
+            return actions
+        target = rtc_context["rtc_target_action"].to(device=actions.device, dtype=actions.dtype)
+        mask = rtc_context["rtc_mask"].to(device=actions.device, dtype=actions.dtype) > 0
+        return torch.where(mask, target, actions)
+
+    def _clip_guidance_grad(self, grad: Tensor, max_norm: float) -> Tensor:
+        max_norm = float(max_norm)
+        if max_norm <= 0:
+            return grad
+        grad_norm = grad.flatten(1).norm(dim=1).clamp_min(1e-6)
+        scale = (max_norm / grad_norm).clamp(max=1.0)
+        return grad * scale.view(-1, *([1] * (grad.ndim - 1)))
+
+    def _pred_original_sample(
+        self,
+        step_out,
+        model_output: Tensor,
+        timestep,
+        sample: Tensor,
+    ) -> Tensor:
+        pred_original_sample = getattr(step_out, "pred_original_sample", None)
+        if pred_original_sample is not None:
+            return pred_original_sample
+
+        t_index = int(timestep.item()) if isinstance(timestep, Tensor) else int(timestep)
+        alphas = self.inference_scheduler.alphas_cumprod.to(
+            device=sample.device,
+            dtype=sample.dtype,
+        )
+        alpha_prod_t = alphas[t_index]
+        beta_prod_t = 1 - alpha_prod_t
+        while alpha_prod_t.ndim < sample.ndim:
+            alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+            beta_prod_t = beta_prod_t.unsqueeze(-1)
+
+        pred_type = self.inference_scheduler.config.prediction_type
+        if pred_type == "epsilon":
+            return (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
+        if pred_type == "sample":
+            return model_output
+        if pred_type == "v_prediction":
+            return alpha_prod_t.sqrt() * sample - beta_prod_t.sqrt() * model_output
+        raise ValueError("Unsupported DDIM prediction_type: {}".format(pred_type))
+
     def iterative_denoise(
         self, 
         traj_shape: Tuple[int, int, int],
         fixed_inputs: Dict[str, Tensor],
-        initial_noise: Optional[Tensor] = None
+        initial_noise: Optional[Tensor] = None,
+        rtc_context: Optional[Dict] = None,
     ):
         """
         Args:
@@ -303,15 +366,54 @@ class ActionExpert(nn.Module):
         
         self.inference_scheduler.set_timesteps(self.inference_timesteps)
         trajectory = initial_noise
+        rtc_mode = self._get_rtc_mode(rtc_context)
+        use_soft_rtc = rtc_mode == "soft" and self._has_rtc_target(rtc_context)
+        use_hard_step = rtc_mode == "hard_step" and self._has_rtc_target(rtc_context)
+
         for t in self.inference_scheduler.timesteps:
+            if use_soft_rtc:
+                trajectory_in = trajectory.detach().requires_grad_(True)
+            else:
+                trajectory_in = trajectory
+
             out = self.dp_head(
-                t * torch.ones(trajectory.shape[0], device=trajectory.device), 
-                trajectory,
+                t * torch.ones(trajectory_in.shape[0], device=trajectory_in.device), 
+                trajectory_in,
                 **fixed_inputs
             )
-            trajectory = self.inference_scheduler.step(
-                out[..., :self.act_dim], t, trajectory[..., :self.act_dim]
-            ).prev_sample
+            model_output = out[..., :self.act_dim]
+            step_out = self.inference_scheduler.step(
+                model_output, t, trajectory_in[..., :self.act_dim]
+            )
+
+            if use_soft_rtc:
+                target = rtc_context["rtc_target_action"].to(
+                    device=trajectory_in.device,
+                    dtype=trajectory_in.dtype,
+                )
+                mask = rtc_context["rtc_mask"].to(
+                    device=trajectory_in.device,
+                    dtype=trajectory_in.dtype,
+                )
+                x0_hat = self._pred_original_sample(
+                    step_out=step_out,
+                    model_output=model_output,
+                    timestep=t,
+                    sample=trajectory_in[..., :self.act_dim],
+                )
+                loss_rtc = ((mask * (x0_hat - target)) ** 2).mean()
+                grad = torch.autograd.grad(loss_rtc, trajectory_in)[0]
+                grad = self._clip_guidance_grad(
+                    grad,
+                    rtc_context.get("rtc_max_grad_norm", 1.0),
+                )
+                guidance_scale = float(rtc_context.get("rtc_guidance_scale", 0.5))
+                trajectory = (step_out.prev_sample - guidance_scale * grad).detach()
+            else:
+                trajectory = step_out.prev_sample
+                if use_hard_step:
+                    trajectory = self._apply_hard_rtc(trajectory, rtc_context)
+
         return trajectory
 
     def forward(
@@ -324,6 +426,7 @@ class ActionExpert(nn.Module):
         valid_ee_mask: Tensor, 
         inference: bool, 
         fp16: bool,
+        rtc_context: Optional[Dict] = None,
     ):
         """
         Args:
@@ -367,12 +470,16 @@ class ActionExpert(nn.Module):
         latest_cam_poses = vl_obs["extrinsics"][:, -1]  # (B, Ncam, 4, 4)
         current_cam_pose = latest_cam_poses[:, 0]  # first camera, (B, 4, 4)
         
-        # patch features as current observation context in diffusion
-        cond, cond_mask = self.context_encoder(
-            vl_obs=vl_obs,
-            vl_feature=vl_feature,
-            fp16=fp16,
-        )
+        rtc_mode = self._get_rtc_mode(rtc_context)
+
+        # Patch context is fixed during guided denoising.
+        context_manager = torch.no_grad() if inference and rtc_mode == "soft" else nullcontext()
+        with context_manager:
+            cond, cond_mask = self.context_encoder(
+                vl_obs=vl_obs,
+                vl_feature=vl_feature,
+                fp16=fp16,
+            )
         
         valid_ee_per_batch = valid_ee_mask.sum(dim=-1)  # (B,)
         sel_index = torch.cat([torch.empty(n, dtype=torch.long).fill_(b) 
@@ -407,8 +514,11 @@ class ActionExpert(nn.Module):
         if inference:
             pred_actions = self.iterative_denoise(
                 traj_shape=(B_expand, Ta, self.act_dim),
-                fixed_inputs=fixed_inputs
+                fixed_inputs=fixed_inputs,
+                rtc_context=rtc_context,
             )  # (B', Ta, act_dim)
+            if rtc_mode == "hard_final":
+                pred_actions = self._apply_hard_rtc(pred_actions, rtc_context)
             pred_future_ee_states = action2states(
                 current_cam_pose[sel_index],    # (B', 4, 4)
                 current_ee_pose[valid_ee_mask], # (B', 4, 4)

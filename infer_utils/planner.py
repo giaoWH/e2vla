@@ -6,10 +6,12 @@ import torch
 import threading
 import numpy as np
 from torch import Tensor
-from typing import Union
+from typing import Any, Dict, Optional, Union
 
 from models import vla
+from models.action_expert import states2action
 from .ensemble import TrajEnsembler
+from data_utils import align
 from data_utils.dataset_base import DataSampler, DataConfig, gen_norm_xy_map, rbd
 from train_utils.ema_impl import ExponentialMovingAverage
 from data_utils.datasets import DATA_CONFIGS
@@ -212,13 +214,232 @@ class TrajPlanner(object):
                                     .to(self.device)
                                     .unsqueeze(0))
         return obs_data
+
+    def _get_rtc_mode(self, rtc_context: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(rtc_context, dict):
+            return "off"
+        return str(rtc_context.get("rtc_mode", "off")).lower()
+
+    def _rtc_enabled(self, rtc_context: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(rtc_context, dict):
+            return False
+        return bool(rtc_context.get("rtc_enabled", False)) and self._get_rtc_mode(rtc_context) != "off"
+
+    def _config_ee_indices(self):
+        ee_indices = self.config.ee_indices
+        if isinstance(ee_indices, int):
+            return (ee_indices,)
+        return tuple(ee_indices)
+
+    def _make_model_future_time(self, obs_data: Dict[str, Any]) -> np.ndarray:
+        Ta = obs_data["gt_future_ee_states"].shape[1]
+        latest_time = obs_data["timestamps"][0].item()
+        action_dt = self.config.sample_dt * self.config.sample_state_gaps
+        return (1 + np.arange(Ta, dtype=np.float64)) * action_dt + latest_time
+
+    def _normalize_rtc_traj(self, rtc_context: Dict[str, Any]):
+        try:
+            old_ee_poses = np.asarray(rtc_context["old_future_ee_poses"])
+            old_grippers = np.asarray(rtc_context["old_future_grippers"])
+            old_time = np.asarray(rtc_context["old_future_time"], dtype=np.float64)
+        except KeyError as exc:
+            print("[RTC] missing rtc_context field: {}".format(exc))
+            return None
+
+        if old_ee_poses.ndim == 3:
+            old_ee_poses = old_ee_poses[:, None]
+        if old_grippers.ndim == 1:
+            old_grippers = old_grippers[:, None]
+
+        if old_ee_poses.ndim != 5 or old_ee_poses.shape[-2:] != (4, 4):
+            print("[RTC] invalid old_future_ee_poses shape: {}".format(old_ee_poses.shape))
+            return None
+        if old_grippers.ndim != 2:
+            print("[RTC] invalid old_future_grippers shape: {}".format(old_grippers.shape))
+            return None
+
+        n = min(len(old_time), len(old_ee_poses), len(old_grippers))
+        old_time = old_time[:n]
+        old_ee_poses = old_ee_poses[:n]
+        old_grippers = old_grippers[:n]
+
+        finite = np.isfinite(old_time)
+        if not finite.all():
+            old_time = old_time[finite]
+            old_ee_poses = old_ee_poses[finite]
+            old_grippers = old_grippers[finite]
+
+        if len(old_time) < 2:
+            print("[RTC] need at least 2 old trajectory points, got {}".format(len(old_time)))
+            return None
+
+        order = np.argsort(old_time)
+        old_time = old_time[order]
+        old_ee_poses = old_ee_poses[order]
+        old_grippers = old_grippers[order]
+
+        keep = np.concatenate([[True], np.diff(old_time) > 1e-6])
+        old_time = old_time[keep]
+        old_ee_poses = old_ee_poses[keep]
+        old_grippers = old_grippers[keep]
+
+        if len(old_time) < 2:
+            print("[RTC] old trajectory timestamps collapse after dedup")
+            return None
+
+        ee_indices = self._config_ee_indices()
+        if old_ee_poses.shape[1] > max(ee_indices):
+            old_ee_poses = old_ee_poses[:, ee_indices]
+            old_grippers = old_grippers[:, ee_indices]
+        elif old_ee_poses.shape[1] != len(ee_indices):
+            print(
+                "[RTC] old trajectory EE shape {} cannot match ee_indices {}".format(
+                    old_ee_poses.shape[1],
+                    ee_indices,
+                )
+            )
+            return None
+
+        return old_ee_poses, old_grippers, old_time
+
+    def _build_model_rtc_context(
+        self,
+        obs_data: Dict[str, Any],
+        rtc_context: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._rtc_enabled(rtc_context):
+            return None
+
+        rtc_mode = self._get_rtc_mode(rtc_context)
+        normalized = self._normalize_rtc_traj(rtc_context)
+        if normalized is None:
+            return None
+
+        old_ee_poses, old_grippers, old_time = normalized
+        model_future_time = self._make_model_future_time(obs_data)
+        valid_time_mask = (
+            (model_future_time >= old_time[0])
+            & (model_future_time <= old_time[-1])
+        )
+        valid_overlap = int(valid_time_mask.sum())
+        min_overlap = max(0, int(rtc_context.get("rtc_min_overlap", 3)))
+        has_target = valid_overlap >= min_overlap
+
+        aligned = align.align_data(
+            query_time=model_future_time,
+            train_time=old_time,
+            train_data={
+                "ee_pose": old_ee_poses,
+                "gripper": old_grippers,
+            },
+            interp_funcs={
+                "ee_pose": align.interp_SE3_sep,
+                "gripper": align.interp_linear,
+            },
+        )
+
+        B, Ta, Nee, _ = obs_data["gt_future_ee_states"].shape
+        rtc_target_world_np = np.zeros((Ta, Nee, 17), dtype=np.float32)
+        rtc_target_world_np[..., :16] = aligned["ee_pose"].astype(np.float32).reshape(Ta, Nee, 16)
+        rtc_target_world_np[..., -1] = aligned["gripper"].astype(np.float32)
+        rtc_target_world = torch.from_numpy(rtc_target_world_np).to(self.device)
+        rtc_target_world = rtc_target_world.unsqueeze(0).repeat(B, 1, 1, 1)
+
+        valid_ee_mask = obs_data["valid_ee_mask"].bool()
+        valid_ee_per_batch = valid_ee_mask.sum(dim=-1)
+        sel_index = torch.cat([
+            torch.empty(n, dtype=torch.long).fill_(b)
+            for b, n in enumerate(valid_ee_per_batch.tolist())
+        ]).to(valid_ee_mask.device)
+
+        if len(sel_index) == 0:
+            print("[RTC] no valid EE in current observation")
+            return None
+
+        current_cam_pose = obs_data["obs_extrinsics"][:, -1, 0]
+        current_ee_pose = obs_data["current_ee_pose"]
+        rtc_target_action = states2action(
+            current_cam_pose[sel_index],
+            current_ee_pose[valid_ee_mask],
+            rtc_target_world.transpose(1, 2)[valid_ee_mask],
+        ).detach()
+
+        delay_steps = max(0, int(rtc_context.get("delay_steps_est", 0)))
+        alpha = max(0.0, float(rtc_context.get("rtc_mask_alpha", 0.2)))
+        step_index = np.arange(Ta, dtype=np.float32)
+        weights = np.where(
+            step_index < delay_steps,
+            1.0,
+            np.exp(-alpha * (step_index - delay_steps)),
+        ).astype(np.float32)
+        overlap_steps = int(np.flatnonzero(valid_time_mask)[-1] + 1) if valid_overlap > 0 else 0
+        weights[step_index >= overlap_steps] = 0.0
+        weights[~valid_time_mask] = 0.0
+        if not has_target:
+            weights[:] = 0.0
+
+        dim_weights = np.array(
+            [float(rtc_context.get("rtc_pos_weight", 1.0))] * 3
+            + [float(rtc_context.get("rtc_rot_weight", 0.5))] * 6
+            + [float(rtc_context.get("rtc_gripper_weight", 0.2))],
+            dtype=np.float32,
+        )
+        rtc_mask_np = weights[None, :, None] * dim_weights[None, None, :]
+        rtc_mask = torch.from_numpy(rtc_mask_np).to(self.device)
+        rtc_mask = rtc_mask.repeat(rtc_target_action.shape[0], 1, 1).detach()
+
+        model_rtc_context = dict(rtc_context)
+        model_rtc_context.update({
+            "rtc_mode": rtc_mode,
+            "model_future_time": model_future_time,
+            "rtc_target_world_states": rtc_target_world.detach(),
+            "rtc_target_action": rtc_target_action,
+            "rtc_mask": rtc_mask,
+            "rtc_has_target": bool(has_target and np.any(weights > 0)),
+            "delay_steps": delay_steps,
+            "overlap_steps": overlap_steps,
+            "valid_overlap": valid_overlap,
+            "rtc_guidance_scale": float(rtc_context.get("rtc_guidance_scale", 0.5)),
+            "rtc_max_grad_norm": float(rtc_context.get("rtc_max_grad_norm", 1.0)),
+        })
+        self._print_rtc_context_summary(model_rtc_context)
+        return model_rtc_context
+
+    def _print_rtc_context_summary(self, rtc_context: Dict[str, Any]):
+        target = rtc_context["rtc_target_action"]
+        mask = rtc_context["rtc_mask"]
+        print(
+            "[RTC] mode={}, has_target={}, delay={}, overlap={}, valid_overlap={}, "
+            "target_shape={}, mask_shape={}, target_minmax=({:.4f},{:.4f}), "
+            "mask_minmax=({:.4f},{:.4f})".format(
+                rtc_context["rtc_mode"],
+                rtc_context["rtc_has_target"],
+                rtc_context["delay_steps"],
+                rtc_context["overlap_steps"],
+                rtc_context["valid_overlap"],
+                tuple(target.shape),
+                tuple(mask.shape),
+                float(target.min().item()),
+                float(target.max().item()),
+                float(mask.min().item()),
+                float(mask.max().item()),
+            )
+        )
     
-    def _run_inference(self, obs_data):
+    def _run_inference(self, obs_data, rtc_context: Optional[Dict[str, Any]] = None):
         for k in obs_data:
             if isinstance(obs_data[k], Tensor):
                 obs_data[k] = obs_data[k].to(self.device, non_blocking=True)
 
-        with torch.inference_mode():
+        model_rtc_context = self._build_model_rtc_context(obs_data, rtc_context)
+        use_soft_rtc = (
+            isinstance(model_rtc_context, dict)
+            and model_rtc_context.get("rtc_mode") == "soft"
+            and model_rtc_context.get("rtc_has_target", False)
+        )
+
+        grad_context = torch.enable_grad() if use_soft_rtc else torch.inference_mode()
+        with grad_context:
             actions: Tensor = self.model(
                 obs_rgbs=obs_data["obs_rgbs"], 
                 obs_masks=obs_data.get("obs_masks", None),
@@ -232,6 +453,7 @@ class TrajPlanner(object):
                 valid_ee_mask=obs_data["valid_ee_mask"],
                 inference=True,
                 fp16=True,
+                rtc_context=model_rtc_context,
             )  # (B, Ta, nee, 17)
         return actions
     
@@ -256,7 +478,8 @@ class TrajPlanner(object):
     def get_action(
         self, 
         draw_traj: bool = False,
-        compress_traj_img: bool = False
+        compress_traj_img: bool = False,
+        rtc_context: Optional[Dict[str, Any]] = None,
     ):
         """
         Returns
@@ -273,7 +496,7 @@ class TrajPlanner(object):
             return None
         
         obs_data = self._make_data_for_infer(obs_frames)
-        actions = self._run_inference(obs_data)
+        actions = self._run_inference(obs_data, rtc_context=rtc_context)
         
         if draw_traj:
             traj_img = visualize_traj(
