@@ -369,9 +369,20 @@ class ActionExpert(nn.Module):
         rtc_mode = self._get_rtc_mode(rtc_context)
         use_soft_rtc = rtc_mode == "soft" and self._has_rtc_target(rtc_context)
         use_hard_step = rtc_mode == "hard_step" and self._has_rtc_target(rtc_context)
+        timesteps = self.inference_scheduler.timesteps
+        num_denoise_steps = len(timesteps)
+        guidance_start_frac = 0.5
+        if use_soft_rtc:
+            guidance_start_frac = float(rtc_context.get("rtc_guidance_start_frac", 0.5))
+            guidance_start_frac = min(max(guidance_start_frac, 0.0), 1.0)
+        guidance_start_step = min(
+            int(num_denoise_steps * guidance_start_frac),
+            max(num_denoise_steps - 1, 0),
+        )
 
-        for t in self.inference_scheduler.timesteps:
-            if use_soft_rtc:
+        for denoise_step, t in enumerate(timesteps):
+            guide_this_step = use_soft_rtc and denoise_step >= guidance_start_step
+            if guide_this_step:
                 trajectory_in = trajectory.detach().requires_grad_(True)
             else:
                 trajectory_in = trajectory
@@ -386,7 +397,7 @@ class ActionExpert(nn.Module):
                 model_output, t, trajectory_in[..., :self.act_dim]
             )
 
-            if use_soft_rtc:
+            if guide_this_step:
                 target = rtc_context["rtc_target_action"].to(
                     device=trajectory_in.device,
                     dtype=trajectory_in.dtype,
