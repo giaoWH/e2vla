@@ -54,6 +54,7 @@ def load_model(path, device, use_ema: bool = False):
         ema.copy_to(param)
         print("[INFO] EMA weights loaded")
 
+    model.requires_grad_(False)
     model.eval()
     return model, data_config
 
