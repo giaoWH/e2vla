@@ -246,12 +246,23 @@ class TrajPlanner(object):
             print("[RTC] missing rtc_context field: {}".format(exc))
             return None
 
+        if old_ee_poses.ndim == 5:
+            if old_ee_poses.shape[0] != 1:
+                print("[RTC] batched old_future_ee_poses is unsupported: {}".format(old_ee_poses.shape))
+                return None
+            old_ee_poses = old_ee_poses[0]
+        if old_grippers.ndim == 3:
+            if old_grippers.shape[0] != 1:
+                print("[RTC] batched old_future_grippers is unsupported: {}".format(old_grippers.shape))
+                return None
+            old_grippers = old_grippers[0]
+
         if old_ee_poses.ndim == 3:
             old_ee_poses = old_ee_poses[:, None]
         if old_grippers.ndim == 1:
             old_grippers = old_grippers[:, None]
 
-        if old_ee_poses.ndim != 5 or old_ee_poses.shape[-2:] != (4, 4):
+        if old_ee_poses.ndim != 4 or old_ee_poses.shape[-2:] != (4, 4):
             print("[RTC] invalid old_future_ee_poses shape: {}".format(old_ee_poses.shape))
             return None
         if old_grippers.ndim != 2:
