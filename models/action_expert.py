@@ -300,6 +300,33 @@ class ActionExpert(nn.Module):
         scale = (max_norm / grad_norm).clamp(max=1.0)
         return grad * scale.view(-1, *([1] * (grad.ndim - 1)))
 
+    def _clip_guidance_grad_with_stats(self, grad: Tensor, max_norm: float):
+        max_norm = float(max_norm)
+        grad_norm = grad.flatten(1).norm(dim=1).clamp_min(1e-6)
+        if max_norm <= 0:
+            scale = torch.ones_like(grad_norm)
+            return grad, grad_norm, scale
+        scale = (max_norm / grad_norm).clamp(max=1.0)
+        return grad * scale.view(-1, *([1] * (grad.ndim - 1))), grad_norm, scale
+
+    @staticmethod
+    def _weighted_masked_rmse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+        weighted_diff = mask * (value - target)
+        denom = mask.square().sum().clamp_min(1e-12)
+        return torch.sqrt(weighted_diff.square().sum() / denom)
+
+    @staticmethod
+    def _mean_or_none(values: List[float]):
+        if len(values) == 0:
+            return None
+        return float(sum(values) / len(values))
+
+    @staticmethod
+    def _max_or_none(values: List[float]):
+        if len(values) == 0:
+            return None
+        return float(max(values))
+
     def _pred_original_sample(
         self,
         step_out,
@@ -365,6 +392,23 @@ class ActionExpert(nn.Module):
             int(num_denoise_steps * guidance_start_frac),
             max(num_denoise_steps - 1, 0),
         )
+        collect_debug = bool(
+            use_rtc_guidance
+            and isinstance(rtc_context, dict)
+            and (
+                rtc_context.get("rtc_collect_debug", False)
+                or rtc_context.get("rtc_return_debug", False)
+                or rtc_context.get("rtc_debug_pair", False)
+            )
+        )
+        debug_loss = []
+        debug_rmse = []
+        debug_grad_norm_mean = []
+        debug_grad_norm_max = []
+        debug_update_norm_mean = []
+        debug_update_norm_max = []
+        debug_clip_ratio = []
+        debug_nan_detected = False
 
         for denoise_step, t in enumerate(timesteps):
             guide_this_step = use_rtc_guidance and denoise_step >= guidance_start_step
@@ -400,15 +444,53 @@ class ActionExpert(nn.Module):
                 )
                 loss_rtc = ((mask * (x0_hat - target)) ** 2).mean()
                 grad = torch.autograd.grad(loss_rtc, trajectory_in)[0]
-                grad = self._clip_guidance_grad(
+                grad, grad_norm, clip_scale = self._clip_guidance_grad_with_stats(
                     grad,
                     rtc_context.get("rtc_max_grad_norm", 1.0),
                 )
                 guidance_scale = float(rtc_context.get("rtc_guidance_scale", 0.5))
+                if collect_debug:
+                    update = guidance_scale * grad
+                    update_norm = update.flatten(1).norm(dim=1)
+                    debug_loss.append(float(loss_rtc.detach().cpu().item()))
+                    debug_rmse.append(float(
+                        self._weighted_masked_rmse(x0_hat, target, mask)
+                        .detach()
+                        .cpu()
+                        .item()
+                    ))
+                    debug_grad_norm_mean.append(float(grad_norm.mean().detach().cpu().item()))
+                    debug_grad_norm_max.append(float(grad_norm.max().detach().cpu().item()))
+                    debug_update_norm_mean.append(float(update_norm.mean().detach().cpu().item()))
+                    debug_update_norm_max.append(float(update_norm.max().detach().cpu().item()))
+                    debug_clip_ratio.append(float((clip_scale < 0.999999).float().mean().detach().cpu().item()))
+                    debug_nan_detected = bool(
+                        debug_nan_detected
+                        or not torch.isfinite(loss_rtc.detach()).all().item()
+                        or not torch.isfinite(x0_hat.detach()).all().item()
+                        or not torch.isfinite(grad.detach()).all().item()
+                    )
                 trajectory = (step_out.prev_sample - guidance_scale * grad).detach()
             else:
                 trajectory = step_out.prev_sample
 
+        if collect_debug:
+            rtc_context["rtc_denoise_debug"] = {
+                "guided_steps": int(len(debug_loss)),
+                "total_steps": int(num_denoise_steps),
+                "guidance_start_step": int(guidance_start_step),
+                "loss_rtc_first": debug_loss[0] if debug_loss else None,
+                "loss_rtc_last": debug_loss[-1] if debug_loss else None,
+                "masked_x0_rmse_first": debug_rmse[0] if debug_rmse else None,
+                "masked_x0_rmse_last": debug_rmse[-1] if debug_rmse else None,
+                "grad_norm_mean": self._mean_or_none(debug_grad_norm_mean),
+                "grad_norm_max": self._max_or_none(debug_grad_norm_max),
+                "update_norm_mean": self._mean_or_none(debug_update_norm_mean),
+                "update_norm_max": self._max_or_none(debug_update_norm_max),
+                "clip_ratio_mean": self._mean_or_none(debug_clip_ratio),
+                "clip_ratio_max": self._max_or_none(debug_clip_ratio),
+                "nan_detected": bool(debug_nan_detected or not torch.isfinite(trajectory.detach()).all().item()),
+            }
         return trajectory
 
     def forward(

@@ -80,6 +80,7 @@ class TrajPlanner(object):
         
         self.device = device
         self.last_obs_data = None
+        self.last_rtc_debug = None
     
     def reset(self):
         with self.ensembler_lock:
@@ -405,6 +406,24 @@ class TrajPlanner(object):
         rtc_mask_np = weights[None, :, None] * dim_weights[None, None, :]
         rtc_mask = torch.from_numpy(rtc_mask_np).to(self.device)
         rtc_mask = rtc_mask.repeat(rtc_target_action.shape[0], 1, 1).detach()
+        mask_nonzero_steps = int(np.sum(weights > 0.0))
+        target_debug = {
+            "rtc_has_target": bool(has_target and np.any(weights > 0)),
+            "valid_overlap": int(valid_overlap),
+            "delay_steps": int(delay_steps),
+            "overlap_start_step": int(overlap_start_step),
+            "overlap_steps": int(overlap_steps),
+            "free_tail_steps": int(free_tail_steps),
+            "mask_nonzero_steps": mask_nonzero_steps,
+            "mask_sum": float(rtc_mask_np.sum()),
+            "mask_max": float(rtc_mask_np.max()) if rtc_mask_np.size else 0.0,
+            "model_time_start": float(model_future_time[0]) if len(model_future_time) else None,
+            "model_time_end": float(model_future_time[-1]) if len(model_future_time) else None,
+            "old_time_start": float(old_time[0]) if len(old_time) else None,
+            "old_time_end": float(old_time[-1]) if len(old_time) else None,
+            "target_shape": tuple(int(x) for x in rtc_target_action.shape),
+            "mask_shape": tuple(int(x) for x in rtc_mask.shape),
+        }
 
         model_rtc_context = dict(rtc_context)
         model_rtc_context.update({
@@ -420,6 +439,7 @@ class TrajPlanner(object):
             "valid_overlap": valid_overlap,
             "rtc_guidance_scale": float(rtc_context.get("rtc_guidance_scale", 0.5)),
             "rtc_max_grad_norm": float(rtc_context.get("rtc_max_grad_norm", 1.0)),
+            "rtc_target_debug": target_debug,
         })
         self._print_rtc_context_summary(model_rtc_context)
         return model_rtc_context
@@ -427,10 +447,12 @@ class TrajPlanner(object):
     def _print_rtc_context_summary(self, rtc_context: Dict[str, Any]):
         target = rtc_context["rtc_target_action"]
         mask = rtc_context["rtc_mask"]
+        target_debug = rtc_context.get("rtc_target_debug", {})
         print(
             "[RTC] has_target={}, delay={}, delay_time={:.1f} ms, "
             "obs_age={:.1f} ms, overlap_start={}, overlap_end={}, "
-            "free_tail={}, valid_overlap={}, "
+            "free_tail={}, valid_overlap={}, mask_nonzero_steps={}, mask_sum={:.4f}, "
+            "old_time=({},{}) model_time=({},{}) "
             "target_shape={}, mask_shape={}, target_minmax=({:.4f},{:.4f}), "
             "mask_minmax=({:.4f},{:.4f})".format(
                 rtc_context["rtc_has_target"],
@@ -441,6 +463,12 @@ class TrajPlanner(object):
                 rtc_context["overlap_steps"],
                 rtc_context["free_tail_steps"],
                 rtc_context["valid_overlap"],
+                int(target_debug.get("mask_nonzero_steps", 0)),
+                float(target_debug.get("mask_sum", 0.0)),
+                target_debug.get("old_time_start"),
+                target_debug.get("old_time_end"),
+                target_debug.get("model_time_start"),
+                target_debug.get("model_time_end"),
                 tuple(target.shape),
                 tuple(mask.shape),
                 float(target.min().item()),
@@ -449,22 +477,28 @@ class TrajPlanner(object):
                 float(mask.max().item()),
             )
         )
-    
-    def _run_inference(self, obs_data, rtc_context: Optional[Dict[str, Any]] = None):
-        for k in obs_data:
-            if isinstance(obs_data[k], Tensor):
-                obs_data[k] = obs_data[k].to(self.device, non_blocking=True)
 
-        model_rtc_context = self._build_model_rtc_context(obs_data, rtc_context)
-        use_rtc_guidance = (
-            isinstance(model_rtc_context, dict)
-            and model_rtc_context.get("rtc_has_target", False)
-        )
+    def _capture_rng_state(self):
+        state = {"cpu": torch.random.get_rng_state()}
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
 
+    def _restore_rng_state(self, state):
+        torch.random.set_rng_state(state["cpu"])
+        if torch.cuda.is_available() and "cuda" in state:
+            torch.cuda.set_rng_state_all(state["cuda"])
+
+    def _run_model_once(
+        self,
+        obs_data,
+        model_rtc_context: Optional[Dict[str, Any]],
+        use_rtc_guidance: bool,
+    ):
         grad_context = torch.enable_grad() if use_rtc_guidance else torch.inference_mode()
         with grad_context:
             actions: Tensor = self.model(
-                obs_rgbs=obs_data["obs_rgbs"], 
+                obs_rgbs=obs_data["obs_rgbs"],
                 obs_masks=obs_data.get("obs_masks", None),
                 obs_norm_xys=obs_data["obs_norm_xys"],
                 obs_extrinsics=obs_data["obs_extrinsics"],
@@ -472,12 +506,149 @@ class TrajPlanner(object):
 
                 current_ee_pose=obs_data["current_ee_pose"],
                 history_ee_states=obs_data["history_ee_states"],
-                gt_future_ee_states=obs_data["gt_future_ee_states"], 
+                gt_future_ee_states=obs_data["gt_future_ee_states"],
                 valid_ee_mask=obs_data["valid_ee_mask"],
                 inference=True,
                 fp16=True,
                 rtc_context=model_rtc_context,
             )  # (B, Ta, nee, 17)
+        return actions
+
+    def _future_states_to_action(self, obs_data, future_states: Tensor) -> Tensor:
+        valid_ee_mask = obs_data["valid_ee_mask"].bool()
+        valid_ee_per_batch = valid_ee_mask.sum(dim=-1)
+        sel_index = torch.cat([
+            torch.empty(n, dtype=torch.long).fill_(b)
+            for b, n in enumerate(valid_ee_per_batch.tolist())
+        ]).to(valid_ee_mask.device)
+        current_cam_pose = obs_data["obs_extrinsics"][:, -1, 0]
+        current_ee_pose = obs_data["current_ee_pose"]
+        return states2action(
+            current_cam_pose[sel_index],
+            current_ee_pose[valid_ee_mask],
+            future_states.transpose(1, 2)[valid_ee_mask],
+        ).detach()
+
+    @staticmethod
+    def _masked_action_error(pred_action: Tensor, target: Tensor, mask: Tensor) -> Dict[str, Optional[float]]:
+        with torch.no_grad():
+            pred_action = pred_action.to(device=target.device, dtype=target.dtype)
+            mask = mask.to(device=target.device, dtype=target.dtype)
+            weighted_diff = mask * (pred_action - target)
+            finite = torch.isfinite(weighted_diff).all()
+            denom = mask.square().sum().clamp_min(1e-12)
+            weighted_rmse = torch.sqrt(weighted_diff.square().sum() / denom)
+            loss_mean = weighted_diff.square().mean()
+        return {
+            "weighted_rmse": float(weighted_rmse.detach().cpu().item()),
+            "loss_mean": float(loss_mean.detach().cpu().item()),
+            "finite": bool(finite.detach().cpu().item()),
+        }
+
+    @staticmethod
+    def _to_debug_dict(
+        model_rtc_context: Optional[Dict[str, Any]],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(model_rtc_context, dict):
+            return extra
+        debug = {
+            "target": model_rtc_context.get("rtc_target_debug"),
+            "denoise": model_rtc_context.get("rtc_denoise_debug"),
+        }
+        if extra:
+            debug.update(extra)
+        return debug
+
+    def _run_inference(self, obs_data, rtc_context: Optional[Dict[str, Any]] = None):
+        for k in obs_data:
+            if isinstance(obs_data[k], Tensor):
+                obs_data[k] = obs_data[k].to(self.device, non_blocking=True)
+
+        self.last_rtc_debug = None
+        model_rtc_context = self._build_model_rtc_context(obs_data, rtc_context)
+        use_rtc_guidance = (
+            isinstance(model_rtc_context, dict)
+            and model_rtc_context.get("rtc_has_target", False)
+        )
+        debug_pair = bool(
+            isinstance(model_rtc_context, dict)
+            and model_rtc_context.get("rtc_debug_pair", False)
+            and use_rtc_guidance
+        )
+
+        if debug_pair:
+            rng_state = self._capture_rng_state()
+            plain_context = dict(model_rtc_context)
+            plain_context["rtc_has_target"] = False
+
+            self._restore_rng_state(rng_state)
+            plain_actions = self._run_model_once(
+                obs_data=obs_data,
+                model_rtc_context=plain_context,
+                use_rtc_guidance=False,
+            )
+            plain_action = self._future_states_to_action(obs_data, plain_actions)
+            plain_error = self._masked_action_error(
+                plain_action,
+                model_rtc_context["rtc_target_action"],
+                model_rtc_context["rtc_mask"],
+            )
+
+            self._restore_rng_state(rng_state)
+            actions = self._run_model_once(
+                obs_data=obs_data,
+                model_rtc_context=model_rtc_context,
+                use_rtc_guidance=True,
+            )
+            guided_action = self._future_states_to_action(obs_data, actions)
+            guided_error = self._masked_action_error(
+                guided_action,
+                model_rtc_context["rtc_target_action"],
+                model_rtc_context["rtc_mask"],
+            )
+            ratio = None
+            if plain_error["weighted_rmse"] > 1e-12:
+                ratio = guided_error["weighted_rmse"] / plain_error["weighted_rmse"]
+            paired_debug = {
+                "plain_weighted_rmse": plain_error["weighted_rmse"],
+                "guided_weighted_rmse": guided_error["weighted_rmse"],
+                "guided_plain_rmse_ratio": ratio,
+                "plain_loss_mean": plain_error["loss_mean"],
+                "guided_loss_mean": guided_error["loss_mean"],
+                "plain_finite": plain_error["finite"],
+                "guided_finite": guided_error["finite"],
+            }
+            self.last_rtc_debug = self._to_debug_dict(
+                model_rtc_context,
+                {"paired": paired_debug},
+            )
+            print(
+                "[RTC] debug_pair plain_rmse={:.6f}, guided_rmse={:.6f}, ratio={}".format(
+                    paired_debug["plain_weighted_rmse"],
+                    paired_debug["guided_weighted_rmse"],
+                    "{:.4f}".format(ratio) if ratio is not None else None,
+                )
+            )
+        else:
+            actions = self._run_model_once(
+                obs_data=obs_data,
+                model_rtc_context=model_rtc_context,
+                use_rtc_guidance=use_rtc_guidance,
+            )
+            if isinstance(model_rtc_context, dict):
+                final_error = None
+                if model_rtc_context.get("rtc_has_target", False):
+                    pred_action = self._future_states_to_action(obs_data, actions)
+                    final_error = self._masked_action_error(
+                        pred_action,
+                        model_rtc_context["rtc_target_action"],
+                        model_rtc_context["rtc_mask"],
+                    )
+                self.last_rtc_debug = self._to_debug_dict(
+                    model_rtc_context,
+                    {"final": final_error},
+                )
         return actions
     
     def _make_empty_action(self, B, Ta, Nee):
@@ -553,7 +724,10 @@ class TrajPlanner(object):
         future_ee_poses = ee_poses[0]  # (Ta, nee, 4, 4)
         future_grippers = grippers[0]  # (Ta, nee)
 
-        return future_ee_poses, future_grippers, future_time, traj_img
+        result = (future_ee_poses, future_grippers, future_time, traj_img)
+        if isinstance(rtc_context, dict) and bool(rtc_context.get("rtc_return_debug", False)):
+            return result + (self.last_rtc_debug,)
+        return result
     
     def set_ensemble_nums(self, n: int):
         with self.ensembler_lock:
