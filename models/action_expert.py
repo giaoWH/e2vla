@@ -282,11 +282,6 @@ class ActionExpert(nn.Module):
         """dimension of action defined in camera frame"""
         return 10
 
-    def _get_rtc_mode(self, rtc_context: Optional[Dict]) -> str:
-        if not isinstance(rtc_context, dict):
-            return "off"
-        return str(rtc_context.get("rtc_mode", "off")).lower()
-
     def _has_rtc_target(self, rtc_context: Optional[Dict]) -> bool:
         if not isinstance(rtc_context, dict):
             return False
@@ -296,13 +291,6 @@ class ActionExpert(nn.Module):
             isinstance(rtc_context.get("rtc_target_action"), Tensor)
             and isinstance(rtc_context.get("rtc_mask"), Tensor)
         )
-
-    def _apply_hard_rtc(self, actions: Tensor, rtc_context: Optional[Dict]) -> Tensor:
-        if not self._has_rtc_target(rtc_context):
-            return actions
-        target = rtc_context["rtc_target_action"].to(device=actions.device, dtype=actions.dtype)
-        mask = rtc_context["rtc_mask"].to(device=actions.device, dtype=actions.dtype) > 0
-        return torch.where(mask, target, actions)
 
     def _clip_guidance_grad(self, grad: Tensor, max_norm: float) -> Tensor:
         max_norm = float(max_norm)
@@ -366,13 +354,11 @@ class ActionExpert(nn.Module):
         
         self.inference_scheduler.set_timesteps(self.inference_timesteps)
         trajectory = initial_noise
-        rtc_mode = self._get_rtc_mode(rtc_context)
-        use_soft_rtc = rtc_mode == "soft" and self._has_rtc_target(rtc_context)
-        use_hard_step = rtc_mode == "hard_step" and self._has_rtc_target(rtc_context)
+        use_rtc_guidance = self._has_rtc_target(rtc_context)
         timesteps = self.inference_scheduler.timesteps
         num_denoise_steps = len(timesteps)
         guidance_start_frac = 0.5
-        if use_soft_rtc:
+        if use_rtc_guidance:
             guidance_start_frac = float(rtc_context.get("rtc_guidance_start_frac", 0.5))
             guidance_start_frac = min(max(guidance_start_frac, 0.0), 1.0)
         guidance_start_step = min(
@@ -381,7 +367,7 @@ class ActionExpert(nn.Module):
         )
 
         for denoise_step, t in enumerate(timesteps):
-            guide_this_step = use_soft_rtc and denoise_step >= guidance_start_step
+            guide_this_step = use_rtc_guidance and denoise_step >= guidance_start_step
             if guide_this_step:
                 trajectory_in = trajectory.detach().requires_grad_(True)
             else:
@@ -422,8 +408,6 @@ class ActionExpert(nn.Module):
                 trajectory = (step_out.prev_sample - guidance_scale * grad).detach()
             else:
                 trajectory = step_out.prev_sample
-                if use_hard_step:
-                    trajectory = self._apply_hard_rtc(trajectory, rtc_context)
 
         return trajectory
 
@@ -481,10 +465,9 @@ class ActionExpert(nn.Module):
         latest_cam_poses = vl_obs["extrinsics"][:, -1]  # (B, Ncam, 4, 4)
         current_cam_pose = latest_cam_poses[:, 0]  # first camera, (B, 4, 4)
         
-        rtc_mode = self._get_rtc_mode(rtc_context)
-
         # Patch context is fixed during guided denoising.
-        context_manager = torch.no_grad() if inference and rtc_mode == "soft" else nullcontext()
+        use_rtc_guidance = self._has_rtc_target(rtc_context)
+        context_manager = torch.no_grad() if inference and use_rtc_guidance else nullcontext()
         with context_manager:
             cond, cond_mask = self.context_encoder(
                 vl_obs=vl_obs,
@@ -528,8 +511,6 @@ class ActionExpert(nn.Module):
                 fixed_inputs=fixed_inputs,
                 rtc_context=rtc_context,
             )  # (B', Ta, act_dim)
-            if rtc_mode == "hard_final":
-                pred_actions = self._apply_hard_rtc(pred_actions, rtc_context)
             pred_future_ee_states = action2states(
                 current_cam_pose[sel_index],    # (B', 4, 4)
                 current_ee_pose[valid_ee_mask], # (B', 4, 4)

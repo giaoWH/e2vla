@@ -216,15 +216,10 @@ class TrajPlanner(object):
                                     .unsqueeze(0))
         return obs_data
 
-    def _get_rtc_mode(self, rtc_context: Optional[Dict[str, Any]]) -> str:
-        if not isinstance(rtc_context, dict):
-            return "off"
-        return str(rtc_context.get("rtc_mode", "off")).lower()
-
     def _rtc_enabled(self, rtc_context: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(rtc_context, dict):
             return False
-        return bool(rtc_context.get("rtc_enabled", False)) and self._get_rtc_mode(rtc_context) != "off"
+        return bool(rtc_context.get("rtc_enabled", False))
 
     def _config_ee_indices(self):
         ee_indices = self.config.ee_indices
@@ -322,7 +317,6 @@ class TrajPlanner(object):
         if not self._rtc_enabled(rtc_context):
             return None
 
-        rtc_mode = self._get_rtc_mode(rtc_context)
         normalized = self._normalize_rtc_traj(rtc_context)
         if normalized is None:
             return None
@@ -414,7 +408,6 @@ class TrajPlanner(object):
 
         model_rtc_context = dict(rtc_context)
         model_rtc_context.update({
-            "rtc_mode": rtc_mode,
             "model_future_time": model_future_time,
             "rtc_target_world_states": rtc_target_world.detach(),
             "rtc_target_action": rtc_target_action,
@@ -435,12 +428,11 @@ class TrajPlanner(object):
         target = rtc_context["rtc_target_action"]
         mask = rtc_context["rtc_mask"]
         print(
-            "[RTC] mode={}, has_target={}, delay={}, delay_time={:.1f} ms, "
+            "[RTC] has_target={}, delay={}, delay_time={:.1f} ms, "
             "obs_age={:.1f} ms, overlap_start={}, overlap_end={}, "
             "free_tail={}, valid_overlap={}, "
             "target_shape={}, mask_shape={}, target_minmax=({:.4f},{:.4f}), "
             "mask_minmax=({:.4f},{:.4f})".format(
-                rtc_context["rtc_mode"],
                 rtc_context["rtc_has_target"],
                 rtc_context["delay_steps"],
                 float(rtc_context.get("delay_time_est", 0.0)) * 1000.0,
@@ -464,13 +456,12 @@ class TrajPlanner(object):
                 obs_data[k] = obs_data[k].to(self.device, non_blocking=True)
 
         model_rtc_context = self._build_model_rtc_context(obs_data, rtc_context)
-        use_soft_rtc = (
+        use_rtc_guidance = (
             isinstance(model_rtc_context, dict)
-            and model_rtc_context.get("rtc_mode") == "soft"
             and model_rtc_context.get("rtc_has_target", False)
         )
 
-        grad_context = torch.enable_grad() if use_soft_rtc else torch.inference_mode()
+        grad_context = torch.enable_grad() if use_rtc_guidance else torch.inference_mode()
         with grad_context:
             actions: Tensor = self.model(
                 obs_rgbs=obs_data["obs_rgbs"], 

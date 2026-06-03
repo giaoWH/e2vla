@@ -103,11 +103,11 @@ class VLA(nn.Module):
             loss (Tensor): scalar tensor
             metrics (Dict[str, Tensor]): metrics for logging
         """
-        rtc_mode = "off"
-        if isinstance(rtc_context, dict):
-            rtc_mode = str(rtc_context.get("rtc_mode", "off")).lower()
-
-        context_manager = torch.no_grad() if inference and rtc_mode == "soft" else nullcontext()
+        use_rtc_guidance = (
+            isinstance(rtc_context, dict)
+            and bool(rtc_context.get("rtc_has_target", False))
+        )
+        context_manager = torch.no_grad() if inference and use_rtc_guidance else nullcontext()
         with context_manager:
             vl_obs, vl_feature = self.vlm(
                 obs_rgbs=obs_rgbs,
