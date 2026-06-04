@@ -319,29 +319,45 @@ class ActionExpert(nn.Module):
     def _weighted_masked_rmse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
         return torch.sqrt(ActionExpert._weighted_masked_mse(value, target, mask))
 
-    def _rtc_guidance_coeff(self, rtc_context: Dict, timestep) -> Tuple[float, Optional[float]]:
-        mode = str(rtc_context.get("rtc_guidance_mode", "fixed")).lower()
-        if mode != "paper":
-            return float(rtc_context.get("rtc_guidance_scale", 0.5)), None
-
-        beta = max(0.0, float(rtc_context.get("rtc_guidance_beta", 5.0)))
-        tau_eps = float(rtc_context.get("rtc_tau_eps", 1e-4))
-        tau_eps = min(max(tau_eps, 1e-8), 0.499999)
+    def _rtc_tau_from_timestep(self, timestep, tau_eps: float) -> float:
         num_train_timesteps = max(
             int(self.inference_scheduler.config.num_train_timesteps),
             1,
         )
         t_value = float(timestep.item()) if isinstance(timestep, Tensor) else float(timestep)
         tau = (t_value + 1.0) / float(num_train_timesteps)
-        tau = min(max(tau, tau_eps), 1.0 - tau_eps)
+        return min(max(tau, tau_eps), 1.0 - tau_eps)
+
+    def _rtc_guidance_coeff(
+        self,
+        rtc_context: Dict,
+        timestep,
+        next_timestep=None,
+    ) -> Tuple[float, Optional[float], float, float]:
+        mode = str(rtc_context.get("rtc_guidance_mode", "fixed")).lower()
+        if mode != "paper":
+            coeff = float(rtc_context.get("rtc_guidance_scale", 0.5))
+            return coeff, None, coeff, 1.0
+
+        beta = max(0.0, float(rtc_context.get("rtc_guidance_beta", 5.0)))
+        tau_eps = float(rtc_context.get("rtc_tau_eps", 1e-4))
+        tau_eps = min(max(tau_eps, 1e-8), 0.499999)
+        tau = self._rtc_tau_from_timestep(timestep, tau_eps)
+        next_tau = (
+            self._rtc_tau_from_timestep(next_timestep, tau_eps)
+            if next_timestep is not None
+            else tau_eps
+        )
+        step_size = abs(tau - next_tau)
 
         one_minus_tau = 1.0 - tau
         r_tau_sq = (
             one_minus_tau * one_minus_tau
             / max(tau * tau + one_minus_tau * one_minus_tau, 1e-12)
         )
-        coeff = min(beta, one_minus_tau / max(tau * r_tau_sq, 1e-12))
-        return float(coeff), float(tau)
+        raw_coeff = min(beta, one_minus_tau / max(tau * r_tau_sq, 1e-12))
+        effective_coeff = step_size * raw_coeff
+        return float(effective_coeff), float(tau), float(raw_coeff), float(step_size)
 
     @staticmethod
     def _mean_or_none(values: List[float]):
@@ -443,10 +459,13 @@ class ActionExpert(nn.Module):
         debug_update_norm_max = []
         debug_clip_ratio = []
         debug_guidance_coeff = []
+        debug_guidance_coeff_raw = []
+        debug_guidance_step_size = []
         debug_tau = []
         debug_nan_detected = False
 
         for denoise_step, t in enumerate(timesteps):
+            next_t = timesteps[denoise_step + 1] if denoise_step + 1 < num_denoise_steps else None
             guide_this_step = use_rtc_guidance and denoise_step >= guidance_start_step
             if guide_this_step:
                 trajectory_in = trajectory.detach().requires_grad_(True)
@@ -484,7 +503,11 @@ class ActionExpert(nn.Module):
                     grad,
                     rtc_context.get("rtc_max_grad_norm", 1.0),
                 )
-                guidance_coeff, tau = self._rtc_guidance_coeff(rtc_context, t)
+                guidance_coeff, tau, raw_coeff, step_size = self._rtc_guidance_coeff(
+                    rtc_context,
+                    t,
+                    next_t,
+                )
                 if collect_debug:
                     update = guidance_coeff * grad
                     update_norm = update.flatten(1).norm(dim=1)
@@ -501,6 +524,8 @@ class ActionExpert(nn.Module):
                     debug_update_norm_max.append(float(update_norm.max().detach().cpu().item()))
                     debug_clip_ratio.append(float((clip_scale < 0.999999).float().mean().detach().cpu().item()))
                     debug_guidance_coeff.append(float(guidance_coeff))
+                    debug_guidance_coeff_raw.append(float(raw_coeff))
+                    debug_guidance_step_size.append(float(step_size))
                     if tau is not None:
                         debug_tau.append(float(tau))
                     debug_nan_detected = bool(
@@ -525,6 +550,21 @@ class ActionExpert(nn.Module):
                 "guidance_coeff_max": self._max_or_none(debug_guidance_coeff),
                 "guidance_coeff_first": debug_guidance_coeff[0] if debug_guidance_coeff else None,
                 "guidance_coeff_last": debug_guidance_coeff[-1] if debug_guidance_coeff else None,
+                "guidance_coeff_effective_mean": self._mean_or_none(debug_guidance_coeff),
+                "guidance_coeff_effective_min": self._min_or_none(debug_guidance_coeff),
+                "guidance_coeff_effective_max": self._max_or_none(debug_guidance_coeff),
+                "guidance_coeff_effective_first": debug_guidance_coeff[0] if debug_guidance_coeff else None,
+                "guidance_coeff_effective_last": debug_guidance_coeff[-1] if debug_guidance_coeff else None,
+                "guidance_coeff_raw_mean": self._mean_or_none(debug_guidance_coeff_raw),
+                "guidance_coeff_raw_min": self._min_or_none(debug_guidance_coeff_raw),
+                "guidance_coeff_raw_max": self._max_or_none(debug_guidance_coeff_raw),
+                "guidance_coeff_raw_first": debug_guidance_coeff_raw[0] if debug_guidance_coeff_raw else None,
+                "guidance_coeff_raw_last": debug_guidance_coeff_raw[-1] if debug_guidance_coeff_raw else None,
+                "guidance_step_size_mean": self._mean_or_none(debug_guidance_step_size),
+                "guidance_step_size_min": self._min_or_none(debug_guidance_step_size),
+                "guidance_step_size_max": self._max_or_none(debug_guidance_step_size),
+                "guidance_step_size_first": debug_guidance_step_size[0] if debug_guidance_step_size else None,
+                "guidance_step_size_last": debug_guidance_step_size[-1] if debug_guidance_step_size else None,
                 "tau_mean": self._mean_or_none(debug_tau),
                 "tau_min": self._min_or_none(debug_tau),
                 "tau_max": self._max_or_none(debug_tau),
