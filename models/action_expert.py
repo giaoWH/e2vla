@@ -349,6 +349,7 @@ class ActionExpert(nn.Module):
             else tau_eps
         )
         step_size = abs(tau - next_tau)
+        diffusion_scale = max(0.0, float(rtc_context.get("rtc_diffusion_scale", 1.0)))
 
         one_minus_tau = 1.0 - tau
         r_tau_sq = (
@@ -356,7 +357,7 @@ class ActionExpert(nn.Module):
             / max(tau * tau + one_minus_tau * one_minus_tau, 1e-12)
         )
         raw_coeff = min(beta, one_minus_tau / max(tau * r_tau_sq, 1e-12))
-        effective_coeff = step_size * raw_coeff
+        effective_coeff = diffusion_scale * step_size * raw_coeff
         return float(effective_coeff), float(tau), float(raw_coeff), float(step_size)
 
     @staticmethod
@@ -571,6 +572,7 @@ class ActionExpert(nn.Module):
                 "tau_first": debug_tau[0] if debug_tau else None,
                 "tau_last": debug_tau[-1] if debug_tau else None,
                 "rtc_guidance_beta": float(rtc_context.get("rtc_guidance_beta", 5.0)),
+                "rtc_diffusion_scale": float(rtc_context.get("rtc_diffusion_scale", 1.0)),
                 "rtc_tau_eps": float(rtc_context.get("rtc_tau_eps", 1e-4)),
                 "loss_rtc_first": debug_loss[0] if debug_loss else None,
                 "loss_rtc_last": debug_loss[-1] if debug_loss else None,
