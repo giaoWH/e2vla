@@ -397,18 +397,34 @@ class TrajPlanner(object):
         if not has_target:
             weights[:] = 0.0
 
-        dim_weights = np.array(
-            [float(rtc_context.get("rtc_pos_weight", 1.0))] * 3
-            + [float(rtc_context.get("rtc_rot_weight", 0.5))] * 6
-            + [float(rtc_context.get("rtc_gripper_weight", 0.2))],
+        raw_group_weights = np.array(
+            [
+                max(0.0, float(rtc_context.get("rtc_pos_weight", 1.0))),
+                max(0.0, float(rtc_context.get("rtc_rot_weight", 0.5))),
+                max(0.0, float(rtc_context.get("rtc_gripper_weight", 0.2))),
+            ],
             dtype=np.float32,
         )
+        group_weight_norm = float(np.linalg.norm(raw_group_weights))
+        if group_weight_norm > 1e-12:
+            group_weights = raw_group_weights / group_weight_norm
+        else:
+            group_weights = np.zeros_like(raw_group_weights)
+
+        dim_weights = np.array(
+            [float(group_weights[0]) / np.sqrt(3.0)] * 3
+            + [float(group_weights[1]) / np.sqrt(6.0)] * 6
+            + [float(group_weights[2])],
+            dtype=np.float32,
+        )
+        dim_weight_norm = float(np.linalg.norm(dim_weights))
         rtc_mask_np = weights[None, :, None] * dim_weights[None, None, :]
         rtc_mask = torch.from_numpy(rtc_mask_np).to(self.device)
         rtc_mask = rtc_mask.repeat(rtc_target_action.shape[0], 1, 1).detach()
         mask_nonzero_steps = int(np.sum(weights > 0.0))
+        rtc_has_target = bool(has_target and np.any(weights > 0) and dim_weight_norm > 0.0)
         target_debug = {
-            "rtc_has_target": bool(has_target and np.any(weights > 0)),
+            "rtc_has_target": rtc_has_target,
             "valid_overlap": int(valid_overlap),
             "delay_steps": int(delay_steps),
             "overlap_start_step": int(overlap_start_step),
@@ -416,7 +432,14 @@ class TrajPlanner(object):
             "free_tail_steps": int(free_tail_steps),
             "mask_nonzero_steps": mask_nonzero_steps,
             "mask_sum": float(rtc_mask_np.sum()),
+            "mask_square_sum": float(np.square(rtc_mask_np).sum()),
             "mask_max": float(rtc_mask_np.max()) if rtc_mask_np.size else 0.0,
+            "dim_weight_raw": raw_group_weights.tolist(),
+            "dim_weight_group_normalized": group_weights.tolist(),
+            "dim_weight_full": dim_weights.tolist(),
+            "dim_weight_group_norm": group_weight_norm,
+            "dim_weight_full_norm": dim_weight_norm,
+            "dim_weight_normalization": "group_l2_projection_unit_norm",
             "model_time_start": float(model_future_time[0]) if len(model_future_time) else None,
             "model_time_end": float(model_future_time[-1]) if len(model_future_time) else None,
             "old_time_start": float(old_time[0]) if len(old_time) else None,
@@ -431,7 +454,7 @@ class TrajPlanner(object):
             "rtc_target_world_states": rtc_target_world.detach(),
             "rtc_target_action": rtc_target_action,
             "rtc_mask": rtc_mask,
-            "rtc_has_target": bool(has_target and np.any(weights > 0)),
+            "rtc_has_target": rtc_has_target,
             "delay_steps": delay_steps,
             "overlap_start_step": overlap_start_step,
             "overlap_steps": overlap_steps,
@@ -452,6 +475,7 @@ class TrajPlanner(object):
             "[RTC] has_target={}, delay={}, delay_time={:.1f} ms, "
             "obs_age={:.1f} ms, overlap_start={}, overlap_end={}, "
             "free_tail={}, valid_overlap={}, mask_nonzero_steps={}, mask_sum={:.4f}, "
+            "mask_sq_sum={:.4f}, dim_group_norm={:.4f}, dim_full_norm={:.4f}, "
             "old_time=({},{}) model_time=({},{}) "
             "target_shape={}, mask_shape={}, target_minmax=({:.4f},{:.4f}), "
             "mask_minmax=({:.4f},{:.4f})".format(
@@ -465,6 +489,9 @@ class TrajPlanner(object):
                 rtc_context["valid_overlap"],
                 int(target_debug.get("mask_nonzero_steps", 0)),
                 float(target_debug.get("mask_sum", 0.0)),
+                float(target_debug.get("mask_square_sum", 0.0)),
+                float(target_debug.get("dim_weight_group_norm", 0.0)),
+                float(target_debug.get("dim_weight_full_norm", 0.0)),
                 target_debug.get("old_time_start"),
                 target_debug.get("old_time_end"),
                 target_debug.get("model_time_start"),

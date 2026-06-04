@@ -310,10 +310,14 @@ class ActionExpert(nn.Module):
         return grad * scale.view(-1, *([1] * (grad.ndim - 1))), grad_norm, scale
 
     @staticmethod
-    def _weighted_masked_rmse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    def _weighted_masked_mse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
         weighted_diff = mask * (value - target)
         denom = mask.square().sum().clamp_min(1e-12)
-        return torch.sqrt(weighted_diff.square().sum() / denom)
+        return weighted_diff.square().sum() / denom
+
+    @staticmethod
+    def _weighted_masked_rmse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+        return torch.sqrt(ActionExpert._weighted_masked_mse(value, target, mask))
 
     @staticmethod
     def _mean_or_none(values: List[float]):
@@ -442,7 +446,7 @@ class ActionExpert(nn.Module):
                     timestep=t,
                     sample=trajectory_in[..., :self.act_dim],
                 )
-                loss_rtc = ((mask * (x0_hat - target)) ** 2).mean()
+                loss_rtc = self._weighted_masked_mse(x0_hat, target, mask)
                 grad = torch.autograd.grad(loss_rtc, trajectory_in)[0]
                 grad, grad_norm, clip_scale = self._clip_guidance_grad_with_stats(
                     grad,
@@ -490,6 +494,7 @@ class ActionExpert(nn.Module):
                 "clip_ratio_mean": self._mean_or_none(debug_clip_ratio),
                 "clip_ratio_max": self._max_or_none(debug_clip_ratio),
                 "nan_detected": bool(debug_nan_detected or not torch.isfinite(trajectory.detach()).all().item()),
+                "loss_normalized_by_mask": True,
             }
         return trajectory
 
