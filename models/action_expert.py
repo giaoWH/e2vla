@@ -319,11 +319,41 @@ class ActionExpert(nn.Module):
     def _weighted_masked_rmse(value: Tensor, target: Tensor, mask: Tensor) -> Tensor:
         return torch.sqrt(ActionExpert._weighted_masked_mse(value, target, mask))
 
+    def _rtc_guidance_coeff(self, rtc_context: Dict, timestep) -> Tuple[float, Optional[float]]:
+        mode = str(rtc_context.get("rtc_guidance_mode", "fixed")).lower()
+        if mode != "paper":
+            return float(rtc_context.get("rtc_guidance_scale", 0.5)), None
+
+        beta = max(0.0, float(rtc_context.get("rtc_guidance_beta", 5.0)))
+        tau_eps = float(rtc_context.get("rtc_tau_eps", 1e-4))
+        tau_eps = min(max(tau_eps, 1e-8), 0.499999)
+        num_train_timesteps = max(
+            int(self.inference_scheduler.config.num_train_timesteps),
+            1,
+        )
+        t_value = float(timestep.item()) if isinstance(timestep, Tensor) else float(timestep)
+        tau = (t_value + 1.0) / float(num_train_timesteps)
+        tau = min(max(tau, tau_eps), 1.0 - tau_eps)
+
+        one_minus_tau = 1.0 - tau
+        r_tau_sq = (
+            one_minus_tau * one_minus_tau
+            / max(tau * tau + one_minus_tau * one_minus_tau, 1e-12)
+        )
+        coeff = min(beta, one_minus_tau / max(tau * r_tau_sq, 1e-12))
+        return float(coeff), float(tau)
+
     @staticmethod
     def _mean_or_none(values: List[float]):
         if len(values) == 0:
             return None
         return float(sum(values) / len(values))
+
+    @staticmethod
+    def _min_or_none(values: List[float]):
+        if len(values) == 0:
+            return None
+        return float(min(values))
 
     @staticmethod
     def _max_or_none(values: List[float]):
@@ -412,6 +442,8 @@ class ActionExpert(nn.Module):
         debug_update_norm_mean = []
         debug_update_norm_max = []
         debug_clip_ratio = []
+        debug_guidance_coeff = []
+        debug_tau = []
         debug_nan_detected = False
 
         for denoise_step, t in enumerate(timesteps):
@@ -452,9 +484,9 @@ class ActionExpert(nn.Module):
                     grad,
                     rtc_context.get("rtc_max_grad_norm", 1.0),
                 )
-                guidance_scale = float(rtc_context.get("rtc_guidance_scale", 0.5))
+                guidance_coeff, tau = self._rtc_guidance_coeff(rtc_context, t)
                 if collect_debug:
-                    update = guidance_scale * grad
+                    update = guidance_coeff * grad
                     update_norm = update.flatten(1).norm(dim=1)
                     debug_loss.append(float(loss_rtc.detach().cpu().item()))
                     debug_rmse.append(float(
@@ -468,21 +500,38 @@ class ActionExpert(nn.Module):
                     debug_update_norm_mean.append(float(update_norm.mean().detach().cpu().item()))
                     debug_update_norm_max.append(float(update_norm.max().detach().cpu().item()))
                     debug_clip_ratio.append(float((clip_scale < 0.999999).float().mean().detach().cpu().item()))
+                    debug_guidance_coeff.append(float(guidance_coeff))
+                    if tau is not None:
+                        debug_tau.append(float(tau))
                     debug_nan_detected = bool(
                         debug_nan_detected
                         or not torch.isfinite(loss_rtc.detach()).all().item()
                         or not torch.isfinite(x0_hat.detach()).all().item()
                         or not torch.isfinite(grad.detach()).all().item()
                     )
-                trajectory = (step_out.prev_sample - guidance_scale * grad).detach()
+                trajectory = (step_out.prev_sample - guidance_coeff * grad).detach()
             else:
                 trajectory = step_out.prev_sample
 
         if collect_debug:
+            guidance_mode = str(rtc_context.get("rtc_guidance_mode", "fixed")).lower()
             rtc_context["rtc_denoise_debug"] = {
                 "guided_steps": int(len(debug_loss)),
                 "total_steps": int(num_denoise_steps),
                 "guidance_start_step": int(guidance_start_step),
+                "guidance_mode": guidance_mode,
+                "guidance_coeff_mean": self._mean_or_none(debug_guidance_coeff),
+                "guidance_coeff_min": self._min_or_none(debug_guidance_coeff),
+                "guidance_coeff_max": self._max_or_none(debug_guidance_coeff),
+                "guidance_coeff_first": debug_guidance_coeff[0] if debug_guidance_coeff else None,
+                "guidance_coeff_last": debug_guidance_coeff[-1] if debug_guidance_coeff else None,
+                "tau_mean": self._mean_or_none(debug_tau),
+                "tau_min": self._min_or_none(debug_tau),
+                "tau_max": self._max_or_none(debug_tau),
+                "tau_first": debug_tau[0] if debug_tau else None,
+                "tau_last": debug_tau[-1] if debug_tau else None,
+                "rtc_guidance_beta": float(rtc_context.get("rtc_guidance_beta", 5.0)),
+                "rtc_tau_eps": float(rtc_context.get("rtc_tau_eps", 1e-4)),
                 "loss_rtc_first": debug_loss[0] if debug_loss else None,
                 "loss_rtc_last": debug_loss[-1] if debug_loss else None,
                 "masked_x0_rmse_first": debug_rmse[0] if debug_rmse else None,

@@ -461,6 +461,9 @@ class TrajPlanner(object):
             "free_tail_steps": free_tail_steps,
             "valid_overlap": valid_overlap,
             "rtc_guidance_scale": float(rtc_context.get("rtc_guidance_scale", 0.5)),
+            "rtc_guidance_mode": str(rtc_context.get("rtc_guidance_mode", "fixed")).lower(),
+            "rtc_guidance_beta": float(rtc_context.get("rtc_guidance_beta", 5.0)),
+            "rtc_tau_eps": float(rtc_context.get("rtc_tau_eps", 1e-4)),
             "rtc_max_grad_norm": float(rtc_context.get("rtc_max_grad_norm", 1.0)),
             "rtc_target_debug": target_debug,
         })
